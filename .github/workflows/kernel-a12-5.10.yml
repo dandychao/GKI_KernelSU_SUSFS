@@ -34,7 +34,7 @@ jobs:
         - sub_level: "233"
           os_patch_level: "2025-02"
           revision: "r1"
-        uses: ./.github/workflows/gki-kernel.yml
+    uses: ./.github/workflows/gki-kernel.yml
     secrets: inherit
     with:
       android_version: "android12"
