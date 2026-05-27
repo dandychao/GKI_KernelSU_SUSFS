@@ -25,9 +25,6 @@ on:
       ksu_variant:
         required: true
         type: string
-      ksu_branch:
-        required: true
-        type: string
 
       # ==================== 可选配置 ====================
       version:
@@ -70,6 +67,10 @@ on:
         required: false
         type: string
         default: "off"
+      droidspaces_ntsync:
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build-kernel:
@@ -93,7 +94,6 @@ jobs:
           echo "子版本号      : ${{ inputs.sub_level }}"
           echo "补丁级别      : ${{ inputs.os_patch_level }}"
           echo "KSU 变体      : ${{ inputs.ksu_variant }}"
-          echo "KSU 分支      : ${{ inputs.ksu_branch }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
@@ -101,6 +101,7 @@ jobs:
           echo "KPM 功能      : ${{ inputs.use_kpm }}"
           echo "Re-Kernel     : ${{ inputs.use_rekernel }}"
           echo "Droidspaces   : ${{ inputs.droidspaces }}"
+          echo "NTSync        : ${{ inputs.droidspaces_ntsync }}"
           echo "Stock Config  : 自动检测 config/stock_defconfig"
           echo "========================================"
 
@@ -356,40 +357,27 @@ jobs:
       - name: 确定 KernelSU 分支
         id: ksu-branch
         run: |
-          branch_input="${{ inputs.ksu_branch }}"
           variant_input="${{ inputs.ksu_variant }}"
 
-          if [ "$variant_input" = "ReSukiSU" ]; then
-            BRANCH="-s main"
-          else
-            case "$branch_input" in
-              "Stable(标准)")
-                case "$variant_input" in
-                  "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  "Official") BRANCH="-s main" ;;
-                  *) BRANCH="-" ;;
-                esac
-                ;;
-              "Dev(开发)")
-                case "$variant_input" in
-                  "Official") BRANCH="-s main" ;;
-                  "Next") ;;
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  *) echo "未知变体: $variant_input" >&2; exit 1 ;;
-                esac
-                ;;
-              *)
-                echo "未知分支: $branch_input" >&2
-                exit 1
-                ;;
-            esac
-
-            # SukiSU 不启用 SUSFS 时强制使用 main 分支
-            if [ "$variant_input" = "SukiSU" ] && [ "${{ inputs.enable_susfs }}" = "false" ]; then
+          case "$variant_input" in
+            "Official"|"ReSukiSU")
               BRANCH="-s main"
-            fi
-          fi
+              ;;
+            "SukiSU")
+              if [ "${{ inputs.enable_susfs }}" = "false" ]; then
+                BRANCH="-s main"
+              else
+                BRANCH="-s builtin"
+              fi
+              ;;
+            "Next")
+              BRANCH=""
+              ;;
+            *)
+              echo "未知变体: $variant_input" >&2
+              exit 1
+              ;;
+          esac
 
           # 检查自定义提交 (仅对 SukiSU 生效)
           CONFIG_FILE="config/config"
@@ -875,6 +863,83 @@ jobs:
           enable_config_if_defined CONFIG_IP_NF_TARGET_REJECT
 
           echo "Droidspaces 集成完成"
+
+          echo "GKI6.6 普通用户联网专用配置 (Droidspaces)"
+          # 专门处理 =n 类型的配置（安卓网络权限必须关闭）
+          disable_config() {
+            local cfg="$1"
+            if grep -q "^${cfg}=n" "$DEFCONFIG"; then
+              echo "  已禁用: $cfg"
+            elif grep -q "^${cfg}=y" "$DEFCONFIG"; then
+              sed -i "s/^${cfg}=y$/${cfg}=n/" "$DEFCONFIG"
+              echo "  已关闭: $cfg"
+            else
+              echo "# ${cfg} is not set" >> "$DEFCONFIG"
+              echo "  已添加并禁用: $cfg"
+            fi
+          }
+
+          if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; then
+            # 1. 开启用户命名空间（必须）
+            # enable_config_if_defined CONFIG_USER_NS
+            # 2. 关闭安卓严格网络控制（必须）
+            disable_config CONFIG_ANDROID_PARANOID_NETWORK
+          fi
+
+      - name: 注入 NTSync 内核配置
+        if: inputs.droidspaces != 'off' && inputs.droidspaces_ntsync
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          set -e
+          echo "=== 开始注入 NTSync 内核补丁 ==="
+          echo "Android 版本: ${{ inputs.android_version }}"
+          echo "Kernel 版本: ${{ inputs.kernel_version }}"
+
+          case "${{ inputs.android_version }}-${{ inputs.kernel_version }}" in
+            android12-5.10)
+              NTSYNC_PATCH="ntsync_compat_android12-5.10"
+              ;;
+            android13-5.15)
+              NTSYNC_PATCH="ntsync_compat_android13-5.15"
+              ;;
+            android14-6.1)
+              NTSYNC_PATCH="ntsync_compat_android14-6.1"
+              ;;
+            android15-6.6)
+              NTSYNC_PATCH="ntsync_compat_android15-6.6"
+              ;;
+            android16-6.12)
+              NTSYNC_PATCH="ntsync_compat_android16-6.12"
+              ;;
+            *)
+              echo "::warning::NTSync: 未适配 ${{ inputs.android_version }} / ${{ inputs.kernel_version }}，跳过补丁"
+              exit 0
+              ;;
+          esac
+
+          echo "自动选择 NTSync 补丁: ${NTSYNC_PATCH}.patch"
+          wget -q "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/refs/heads/main/NTsync/ntsync_base.patch"
+          wget -q "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/refs/heads/main/NTsync/${NTSYNC_PATCH}.patch"
+
+          patch -p1 < "ntsync_base.patch"
+          patch -p1 < "${NTSYNC_PATCH}.patch"
+
+          cd ..
+
+          # 配置路径
+          CONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
+          echo "正在检查并启用 CONFIG_NTSYNC..."
+
+          # 移除未启用标记，再追加启用项，保证重复运行时保持幂等。
+          sed -i '/CONFIG_NTSYNC is not set/d' "$CONFIG_PATH"
+          if ! grep -q "^CONFIG_NTSYNC=y" "$CONFIG_PATH"; then
+            echo "CONFIG_NTSYNC=y" >> "$CONFIG_PATH"
+            echo "✅ 已成功启用 CONFIG_NTSYNC"
+          else
+            echo "✅ CONFIG_NTSYNC 已处于启用状态"
+          fi
+
+          echo "=== NTSync 补丁与配置注入完成 ==="
 
       - name: 应用 Unicode 绕过修复
         if: inputs.enable_susfs
